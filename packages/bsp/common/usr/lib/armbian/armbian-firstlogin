@@ -679,6 +679,7 @@ if [[ -f /root/.not_logged_in_yet && -n $(tty) ]]; then
 	# disable autologin
 	rm -f /etc/systemd/system/getty@.service.d/override.conf
 	rm -f /etc/systemd/system/serial-getty@.service.d/override.conf
+	rm -f /etc/systemd/system/kmsconvt@tty1.service.d/override.conf
 	systemctl daemon-reload
 
 	declare desktop_dm="none"
@@ -796,6 +797,12 @@ if [[ -f /root/.not_logged_in_yet && -n $(tty) ]]; then
 		current_tty=$(tty | sed 's:/dev/::')  # e.g., "tty1"
 		current_pid=$$
 
+		if [ -s /root/.not_logged_in_yet ]; then
+			if [ "$current_tty" != "tty1"  ];then
+				sleep 1
+			fi
+		fi
+		
 		# Kill ONLY other active root SHELL sessions (not login processes)
 		ps -u root -o pid,tty,comm |
 		  awk -v me="$current_tty" -v mypid="$current_pid" '
