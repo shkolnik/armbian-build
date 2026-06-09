@@ -16,7 +16,7 @@ The framework supports **native**, **cross**, and **containerized** builds for m
 ## Quick Start
 
 ```bash
-git clone https://github.com/NickAlilovic/build.git --branch Radxa-A7A
+git clone https://github.com/armbian/build
 cd build
 ./compile.sh
 ```
