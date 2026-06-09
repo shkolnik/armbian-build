@@ -12,7 +12,10 @@ IMAGE_PARTITION_TABLE="msdos"
 # multiple A733 boards (which use different vendor kernel trees) can share the
 # family. The Armbian build sources this board file before the family file, so
 # these assignments win.
-KERNELSOURCE="${GITHUB_SOURCE}/orangepi-xunlong/linux-orangepi.git"
+# NB: the full github.com URL is hardcoded (not ${GITHUB_SOURCE}) because that
+# mirror variable is only defined *after* board configs are sourced. This matches
+# how other per-board-kernel boards do it (e.g. thinkpad-x13s, wdk2023).
+KERNELSOURCE="https://github.com/orangepi-xunlong/linux-orangepi.git"
 case "${BRANCH}" in
 	legacy)
 		# BSP 5.15 (Bullseye-era; needed for working GPU/VPU blobs).
