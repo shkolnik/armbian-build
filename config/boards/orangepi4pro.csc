@@ -1,8 +1,11 @@
 # Allwinner A733 octa core 2-16GB RAM GBE USB3 WiFi/BT NVMe eMMC
 BOARD_NAME="Orange Pi 4 Pro"
+BOARD_VENDOR="xunlong"
 BOARDFAMILY="sun60iw2"
 BOARD_MAINTAINER="shkolnik"
+INTRODUCED="2025"
 KERNEL_TARGET="vendor"
+KERNEL_TEST_TARGET="vendor"
 BOOT_FDT_FILE="allwinner/sun60i-a733-orangepi-4-pro.dtb"
 OVERLAY_PREFIX="sun60i-a733"
 IMAGE_PARTITION_TABLE="msdos"
@@ -12,15 +15,16 @@ IMAGE_PARTITION_TABLE="msdos"
 # multiple A733 boards (which use different vendor kernel trees) can share the
 # family. The Armbian build sources this board file before the family file, so
 # these assignments win.
-# NB: the full github.com URL is hardcoded (not ${GITHUB_SOURCE}) because that
-# mirror variable is only defined *after* board configs are sourced. This matches
-# how other per-board-kernel boards do it (e.g. thinkpad-x13s, wdk2023).
+
+# Note: the full github.com URL is hardcoded (not ${GITHUB_SOURCE}) because that
+# mirror variable is only defined *after* board configs are sourced.
 KERNELSOURCE="https://github.com/orangepi-xunlong/linux-orangepi.git"
+
 # Vendor BSP 6.6 (orange-pi-6.6-sun60iw2) is the only branch supported/validated
 # for this board, so KERNEL_TARGET="vendor" above and the values are set directly.
 # A 5.15 "legacy" BSP exists upstream (its only real draw is bullseye-era GPU/VPU
 # blobs, irrelevant to this headless board). To add it later: set
-# KERNEL_TARGET="vendor,legacy", re-introduce a $BRANCH case here, and add a
+# KERNEL_TARGET="vendor,legacy", introduce a $BRANCH case here, and add a
 # linux-sun60iw2-opi-legacy.config + patch/kernel/archive/sun60iw2-opi-legacy/.
 KERNELBRANCH="branch:orange-pi-6.6-sun60iw2"
 declare -g KERNEL_MAJOR_MINOR="6.6"
@@ -28,12 +32,13 @@ KERNELPATCHDIR="archive/sun60iw2-opi-vendor"
 LINUXCONFIG="linux-sun60iw2-opi-vendor"
 
 # --- Boot: vendor U-Boot specifics ---
-declare -g SERIALCON="ttyS0"
-declare -g BOOTSCRIPT="boot-sun60iw2-opi.cmd:boot.cmd"
 # The vendor U-Boot is a 32-bit ARM binary: uInitrd must be tagged arch=arm or
 # bootm/booti rejects it ("No Linux ARM Ramdisk Image").
 declare -g INITRD_ARCH="arm"
+declare -g SERIALCON="ttyS0"
+declare -g BOOTSCRIPT="boot-sun60iw2-opi.cmd:boot.cmd"
 declare -g OFFSET=32
+
 # Boot images (boot0_sdcard.fex / boot0_spinor.fex / boot_package.fex) are built
 # entirely from pinned Orange Pi sources at image-build time by the
 # build_custom_uboot__orangepi4pro() hook at the bottom of this file — nothing
@@ -42,13 +47,12 @@ declare -g OFFSET=32
 # offsets (write_uboot_platform/_mtd).
 
 # --- WiFi/BT: AICSemi AIC8800D80 on SDIO (sdc1) ---
-# Use the in-tree vendor modules (built =m in the vendor 6.6 kernel) rather than
-# the radxa-aic8800 DKMS extension: that extension is gated on working kernel
-# headers (the vendor kernel has none) and leaves a DKMS fdrv that mismatches the
-# in-tree bsp ("Unknown symbol"). Loading aic8800_fdrv pulls aic8800_bsp (symbol
-# dep), powers the chip, enumerates the SDIO card and creates wlan0. Firmware
-# comes from armbian-firmware via the symlink in post_family_tweaks below.
-# aic8800_btlpm = Bluetooth.
+# Vendor's in-tree aic8800 modules (=m in the 6.6 BSP). Loading aic8800_fdrv
+# pulls aic8800_bsp (symbol dep), powers the chip, enumerates the SDIO card and
+# creates wlan0. Firmware comes from armbian-firmware via the symlink in
+# post_family_tweaks below. aic8800_btlpm = Bluetooth.
+# Don't swap in an out-of-tree AIC8800 DKMS driver — it shadows the in-tree bsp
+# symbols and breaks fdrv ("Unknown symbol").
 MODULES="aic8800_bsp aic8800_fdrv aic8800_btlpm"
 
 # --- Board-specific rootfs tweaks (Armbian hook; runs after family_tweaks) ---
