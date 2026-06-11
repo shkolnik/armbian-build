@@ -39,10 +39,10 @@ declare -g BOOTSCRIPT="boot-sun60iw2-opi.cmd:boot.cmd"
 # bootm/booti rejects it ("No Linux ARM Ramdisk Image").
 declare -g INITRD_ARCH="arm"
 declare -g OFFSET=32
-# Subdir under packages/blobs/sunxi/sun60iw2/ with this board's prebuilt boot
-# blobs (boot0_sdcard.fex / boot_package.fex / boot0_spinor.fex); read by the
-# family's build_custom_uboot. See that dir's README.md / build-boot-package.sh.
-declare -g UBOOT_BLOB_DIR="opi4pro"
+# Boot images (boot0_sdcard.fex / boot0_spinor.fex / boot_package.fex) are built
+# entirely from pinned Orange Pi sources at image-build time by the family's
+# build_custom_uboot() — nothing binary is committed. Pins live inline in that
+# function so changes bust Armbian's u-boot artifact cache.
 
 # --- WiFi/BT: AICSemi AIC8800D80 on SDIO (sdc1) ---
 # Use the in-tree vendor modules (built =m in the vendor 6.6 kernel) rather than
