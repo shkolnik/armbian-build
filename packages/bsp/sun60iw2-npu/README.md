@@ -1,61 +1,76 @@
-# sun60iw2-npu — opt-in VeriSilicon VIP9000 NPU enabler (Allwinner A733)
+# sun60iw2-npu — opt-in VeriSilicon VIP9000 NPU enablers (Allwinner A733)
 
-`enable-npu.sh` turns on the A733's VeriSilicon **VIP9000** NPU (~3 TOPS) on Armbian
-sun60iw2. It is **opt-in** and installs **non-redistributable** userspace, so it is shipped
-to `/usr/local/sbin/` but never run automatically and nothing is baked into the image
-(same policy as the GPU enabler).
+The A733's VeriSilicon **VIP9000** NPU (~3 TOPS) has two software stacks. This package
+ships an opt-in enabler for each; both are shipped to `/usr/local/sbin/` but **never run
+automatically** (they install non-redistributable userspace — same policy as the GPU
+enabler). The two paths are **mutually exclusive** (galcore and vipcore drive the same
+NPU registers/IRQ).
 
-## What works without this script
+| Script | Path | Kernel driver | Userspace | Runtime |
+|---|---|---|---|---|
+| **`enable-npu`** (default) | Unified / OpenVX | **galcore** `/dev/galcore` | `libGAL`/`libOpenVX`/`libVSC`/`libCLC`/`libovxlib` | OpenVX + OpenCL + JIT → **TIM-VX → ONNX-RT / TFLite** (broad ops, CPU fallback) |
+| `enable-npu-vipcore` | VIPLite / NBG | **vipcore** `/dev/vipcore` (in-tree) | `libVIPhal`+`libNBGlinker` | precompiled **NBG only** (no JIT/op-fallback), `vpm_run` |
 
-The kernel driver is **already in-tree**: our kernel builds `vipcore.ko`
-(`CONFIG_AW_NNA_VIP=m` + `CONFIG_NNA_VIP2=y`), it autoloads at boot, and creates
-`/dev/vipcore` (mode 0666). The board DT (`npu@3600000`) is enabled, the NPU is
-firmware-less, and needs no CMA/reserved-memory. So out of the box the *kernel* side is
-live — what's missing is the **userspace runtime** to submit a model to it.
+Pick **`enable-npu`** (galcore) for real-world models — it's the richer path that standard
+runtimes ride on. Use `enable-npu-vipcore` only for the minimal precompiled-NBG runtime.
 
-## What the script does
+## `enable-npu` — Unified / OpenVX (galcore) — DEFAULT
 
-1. Confirms `vipcore.ko` exists for the running kernel and sets it to autoload.
-2. Fetches the **VIPLite v2.0 userspace** from Radxa's AI-SDK
-   (`github.com/ZIFENG278/ai-sdk`, **pinned commit**, sparse blobless clone ≈ a few MB):
-   `libVIPhal.so` + `libNBGlinker.so` → `/usr/local/lib/npu` (+ `ldconfig`), headers →
-   `/usr/local/include/npu`.
-3. Builds and installs **`vpm_run`** (the generic NBG runner) to `/usr/local/bin`, plus a
-   sample `v3` NBG to `/usr/local/share/npu`.
-4. Adds a udev rule for `/dev/vipcore`, `modprobe`s `vipcore`, and **self-tests**: runs the
-   sample NBG and checks the kernel↔userspace handshake (`vip lite init OK`,
-   `cid=0x1000003b`, `vpm run ret=0`).
+What it does, on the running kernel (`linux-headers` + `bsp/include` must be present):
+1. **Builds galcore 6.4.15** from MaverickLong's package (pinned) — applies its 6.6
+   kernel-API-drift patch + the `$(srctree)/$(src)→$(M)` Kbuild fix, `make CONFIG_AW_NNA_GALCORE=m`.
+2. Installs the module to `/lib/modules/$(uname -r)/updates/`, `depmod`, **blacklists vipcore**
+   and autoloads galcore (`modules-load.d`), adds a `/dev/galcore` udev rule.
+3. Installs the matched **Unified userspace 6.4.15** (ai-sdk `unified-tina`, pinned, sparse) to
+   `/usr/local/lib/npu-unified` (+ `ldconfig`), headers to `/usr/local/include/npu-unified`.
+4. Activates now (rmmod vipcore → modprobe galcore) and **self-tests** a `vxCreateContext`
+   handshake against the userspace.
 
 Idempotent, re-execs under sudo, activates now so running == next boot.
 
-## Version coupling (important)
+**Why galcore 6.4.15 and not the in-tree driver:** the gcHAL kernel↔userspace versions must
+match **exactly**. Our BSP's in-tree galcore is **6.4.18**, but the only public Unified
+userspace is **6.4.15** — a 6.4.18 driver fails `vxCreateContext` with `NO_RESOURCES`
+(orangepi-build bug #302). So the enabler does **not** enable `CONFIG_AW_NNA_GALCORE`; it
+builds the 6.4.15 driver to match the userspace. Validated on HW 2026-06-18: handshake OK,
+and TIM-VX **LeNet ran on the NPU** (see notes/22 §"★ RESOLVED", notes/23).
 
-Userspace and kernel share a strict ABI handshake `0x00020003` (= driver `2.0.3.x-AW`).
-Our kernel ships `2.0.3.4-AW`; the pinned AI-SDK userspace is `2.0.3.2-AW` — these pair
-cleanly (validated). If you bump either side, re-check: a mismatch makes `vip_init` fail
-with a lib-version error even though the module loads.
+**Running your own model:** build **TIM-VX** against the userspace (`-DEXTERNAL_VIV_SDK`),
+then ONNX-Runtime (VSINPU EP) or TFLite (VX delegate). A standalone bring-up/validation
+recipe lives at the project root: `npu-galcore-timvx-bringup.sh`. Known A733 caveats: cast
+conv/FC operands to UINT8; use FullyConnected instead of batched MatMul.
 
-## Running your own model
+## `enable-npu-vipcore` — VIPLite / NBG (alternate)
 
-The NPU runs a precompiled **NBG** (`.nb`). Convert ONNX/TFLite → NBG **off-device** with
-Allwinner's ACUITY toolkit (x86 Docker, `v3`/A733) or VeriSilicon **TIM-VX**, then:
+The kernel driver (`vipcore.ko`, `CONFIG_AW_NNA_VIP=m`+`NNA_VIP2=y`) is **in-tree** and
+autoloads → `/dev/vipcore`. This script installs the **VIPLite v2.0 userspace** (`libVIPhal`+
+`libNBGlinker`, pinned ai-sdk, sparse) to `/usr/local/lib/npu`, builds **`vpm_run`** (generic
+NBG runner) + a sample, adds a udev rule, and self-tests a `v3` NBG (`vip lite init OK`,
+`cid=0x1000003b`, `ret=0`). Runs a **precompiled NBG only** — convert ONNX/TFLite→NBG
+off-device (ACUITY or TIM-VX). Validated on HW (`2.0.3.2-AW` userspace ↔ `2.0.3.4-AW` kernel).
 
-```sh
-printf '[network]\n/path/to/model.nb\n[input]\n/path/to/input.dat\n' > sample.txt
-vpm_run -s sample.txt -l 1 --show_top5 1     # expect cid=0x1000003b, ret=0
-```
+## Version coupling (important, both paths)
 
-## Note: NPU clock is capped at 852 MHz on this board
+- **galcore/Unified:** gcHAL versions must match **exactly** — `6.4.15.3.690884` on both sides
+  (a build-digit skew is NOT tolerated; that's the whole reason for the 6.4.15 driver build).
+- **vipcore/VIPLite:** keys on ABI `0x00020003` (= `2.0.3.x`); the trailing build digit doesn't
+  gate, so userspace `2.0.3.2-AW` pairs with kernel `2.0.3.4-AW`.
 
-On the **Orange Pi 4 Pro** `VDD-NPU` shares the 0.8 V `DCDC2` rail (with HDMI/DRAM/UFS/
-combo-PHYs), so the NPU cannot reach the 0.96 V its 1008 MHz OPP needs — running 1008 MHz
-undervolts the NPU and causes **intermittent silent compute errors**. The board DT patch
-`orangepi4pro: cap NPU at 852MHz` drops the 1008/1120 MHz OPPs so the driver tops out at
-852 MHz @ 0.8 V (validated: 10000/10000 NPU golden compares pass). This is board-specific —
-other A733 boards with a dedicated NPU rail may keep 1008 MHz.
+If you bump either side of either path, re-check the handshake.
+
+## NPU clock is capped at 852 MHz on this board (both paths)
+
+On the **Orange Pi 4 Pro** `VDD-NPU` shares the 0.8 V `DCDC2` rail (HDMI/DRAM/UFS/combo-PHYs),
+so the NPU cannot reach the 0.96 V its 1008 MHz OPP needs — running 1008 MHz undervolts the NPU
+and causes **intermittent silent compute errors**. The board DT patch
+`0005-orangepi4pro-cap-npu-852mhz.patch` caps at 852 MHz: it deletes the 1008/1120 MHz OPPs
+(caps vipcore, which selects the top OPP) **and** retargets `npu-vf` to `0x354` (852 — required
+because galcore is OPP-exact). Board-specific; other A733 boards with a dedicated NPU rail may
+keep 1008 MHz. (vipcore validated 10000/10000 golden at 852; the combined patch warrants a
+quick re-validation of both drivers at clean-test.)
 
 ## Licensing
 
-The VIPLite userspace libs are a proprietary VeriSilicon/Allwinner blob redistributed by a
-community repo with unstated terms — hence **opt-in fetch at runtime, never bundled**. The
-kernel driver sources are dual MIT/GPL (already in-tree).
+The userspace libs (VIPLite or Unified) are proprietary VeriSilicon/Allwinner blobs
+redistributed by community repos with unstated terms — hence **opt-in fetch at runtime, never
+bundled**. The galcore and vipcore kernel driver sources are dual MIT/GPL.

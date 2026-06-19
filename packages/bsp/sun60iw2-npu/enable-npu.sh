@@ -1,99 +1,132 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# enable-npu.sh — opt-in enabler for the A733 (sun60iw2) NPU, **Unified / OpenVX** path
+# (galcore). This is the DEFAULT NPU path. The lite alternate is enable-npu-vipcore.sh
+# (VIPLite/NBG). The two are MUTUALLY EXCLUSIVE — galcore and vipcore drive the same NPU
+# regs/IRQ; this script blacklists vipcore and loads galcore instead. Installs
+# non-redistributable userspace, so like the VIPLite + GPU enablers it is shipped but
+# never run automatically.
 #
-# enable-npu.sh — opt-in VeriSilicon VIP9000 NPU userspace for Armbian sun60iw2
-# (Allwinner A733). The kernel driver (vipcore.ko, CONFIG_AW_NNA_VIP) is in-tree and
-# autoloads, so this only installs the non-redistributable VIPLite v2.0 userspace +
-# the vpm_run runner, wires up the device node, and self-tests on /dev/vipcore.
-# Validated on Orange Pi 4 Pro (headless Trixie): handshake 0x00020003, cid 0x1000003b,
-# a v3 NBG ran on-NPU. See README.md.
+# Validated on hardware 2026-06-18: galcore 6.4.15 + matched 6.4.15 Unified userspace
+# -> vxCreateContext SUCCESS, and TIM-VX LeNet ran on the NPU. See
+# notes/22 (§"★ RESOLVED") and packages/bsp/sun60iw2-npu/README.md.
 #
-# SPDX-License-Identifier: GPL-2.0
+# WHY 6.4.15 and not the in-tree driver: the gcHAL kernel<->userspace versions must
+# match EXACTLY. Our BSP's in-tree galcore is 6.4.18, but the only public Unified
+# userspace is 6.4.15 -> a 6.4.18 driver fails vxCreateContext with NO_RESOURCES
+# (OPi bug #302). So we DO NOT enable CONFIG_AW_NNA_GALCORE; we build the 6.4.15
+# driver from MaverickLong's package (6.4.15 source + a 6.6 kernel-API-drift patch).
 #
-
+# NOTE (board DT): galcore is OPP-exact — it reads `npu-vf` and demands that exact OPP.
+# The OPi 4 Pro DT cap must set `npu-vf = <0x354>` (852MHz) for galcore to clock
+# correctly (see the board patch). Without it the NPU falls back to an unmanaged clock.
 set -euo pipefail
 
-# Proprietary VIPLite userspace (Radxa AI-SDK; libs are committed, not an apt package).
-# Pinned for reproducibility; userspace is fetched on demand, never baked into the image.
+# --- pinned sources ---------------------------------------------------------
+GALCORE_REPO="https://github.com/MaverickLong/Radxa-A733-NPU-Unified-Driver-Support-Package.git"
+GALCORE_COMMIT="69548908aeedfa349a63d6a268ae0c88e0d18ee3"   # galcore 6.4.15.3.690884 + 6.6 drift patch
 AISDK_REPO="https://github.com/ZIFENG278/ai-sdk.git"
-AISDK_COMMIT="fc90006d0f6569da2f6726c2d8395877686f5aca"      # 2025-10-20
-AISDK_LIB="viplite-tina/lib/aarch64-none-linux-gnu/v2.0"     # A733 = NPU SW v2.0
-# Minimal sparse set needed to install the libs and build vpm_run.
-AISDK_SPARSE=(machinfo examples/vpm_run examples/libawnn_viplite examples/libawutils "${AISDK_LIB}")
+AISDK_COMMIT="fc90006d0f6569da2f6726c2d8395877686f5aca"     # Unified userspace 6.4.15.3.690884
+GCHAL_VER="6.4.15.3.690884"
+INC="unified-tina/inc"
+UNI="unified-tina/lib/aarch64-none-linux-gnu"
 
-NPU_LIBDIR="/usr/local/lib/npu"
-NPU_INCDIR="/usr/local/include/npu"
-NPU_SHARE="/usr/local/share/npu"
+LIBDIR="/usr/local/lib/npu-unified"
+INCDIR="/usr/local/include/npu-unified"
+WORK="/var/cache/npu-galcore-build"
+KREL="$(uname -r)"
 
-log() { echo ">> $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+# Re-exec under sudo so running == next boot.
+if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
 
-# Needs root (apt, install to /usr/local + /etc, modprobe); re-exec under sudo.
-if [[ ${EUID} -ne 0 ]]; then
-	command -v sudo > /dev/null 2>&1 || die "must run as root (sudo not found)"
-	log "Not root — re-running under sudo"
-	exec sudo -- "$0" "$@"
+echo "== A733 NPU Unified/OpenVX (galcore) enabler =="
+
+# --- 0. prerequisites -------------------------------------------------------
+[[ -d "/lib/modules/${KREL}/build" ]] || { echo "FATAL: linux-headers-${KREL} missing"; exit 1; }
+find "/lib/modules/${KREL}/build" -name sunxi-sid.h | grep -q . \
+    || echo "WARN: bsp/include/sunxi-sid.h not found — galcore build may fail"
+for t in gcc make git; do command -v "$t" >/dev/null || { echo "FATAL: need $t"; exit 1; }; done
+
+mkdir -p "$WORK"; cd "$WORK"
+
+# --- 1. build galcore 6.4.15 ------------------------------------------------
+if [[ ! -d galcore-pkg/.git ]]; then
+    rm -rf galcore-pkg && git clone "$GALCORE_REPO" galcore-pkg
 fi
+git -C galcore-pkg fetch -q origin "$GALCORE_COMMIT" && git -C galcore-pkg checkout -q "$GALCORE_COMMIT"
+(
+    cd galcore-pkg
+    grep -q "$GCHAL_VER" aw_nna_galcore/hal/inc/gc_hal_version.h \
+        || { echo "FATAL: galcore source is not ${GCHAL_VER}"; exit 1; }
+    # Apply the kernel-API-drift patch from the package root (patch -p1; the repo's
+    # apply_*.bash uses git-apply which needs a git toplevel a fresh checkout lacks).
+    if ! patch -p1 --reverse --dry-run <galcore_6.6_kernel_api_drift.patch >/dev/null 2>&1; then
+        patch -p1 <galcore_6.6_kernel_api_drift.patch
+    fi
+    # build_galcore.bash does the $(srctree)/$(src)->$(M) Kbuild fix + make CONFIG_AW_NNA_GALCORE=m
+    bash build_galcore.bash
+)
+KO="${WORK}/galcore-pkg/aw_nna_galcore/galcore.ko"
+[[ -f "$KO" ]] || { echo "FATAL: galcore.ko not built"; exit 1; }
 
-KVER="$(uname -r)"
-case "${KVER}" in
-	*sun60iw2*) ;;
-	*) die "This is for sun60iw2 (A733) kernels; running kernel is '${KVER}'." ;;
-esac
-log "Target kernel: ${KVER}"
+# --- 2. install module + autoload, exclude vipcore --------------------------
+install -D -m644 "$KO" "/lib/modules/${KREL}/updates/galcore.ko"
+depmod "$KREL"
+echo "blacklist vipcore" > /etc/modprobe.d/npu-galcore-blacklist.conf   # galcore replaces vipcore
+echo "galcore"           > /etc/modules-load.d/npu-galcore.conf
+printf 'KERNEL=="galcore", MODE="0666"\n' > /etc/udev/rules.d/99-npu-galcore.rules
 
-# --- Kernel side: module is in-tree, just confirm + autoload --------------------
-log "Checking the in-tree NPU kernel driver (vipcore)"
-modinfo vipcore > /dev/null 2>&1 || die "vipcore.ko not found for ${KVER}; kernel wasn't built with CONFIG_AW_NNA_VIP=m"
-echo "vipcore" > /etc/modules-load.d/npu.conf
-
-# --- Prerequisites + fetch userspace -------------------------------------------
-log "Installing prerequisites (git, build tools)"
-apt-get update
-apt-get install -y --no-install-recommends git ca-certificates build-essential || die "could not install prerequisites"
-
-tmpd="$(mktemp -d)"; trap 'rm -rf "${tmpd}"' EXIT
-log "Fetching VIPLite userspace from ai-sdk @ ${AISDK_COMMIT:0:12} (sparse, blobless)"
-git clone --filter=blob:none --sparse "${AISDK_REPO}" "${tmpd}/ai-sdk" || die "ai-sdk clone failed"
-git -C "${tmpd}/ai-sdk" sparse-checkout set "${AISDK_SPARSE[@]}" || die "sparse-checkout failed"
-git -C "${tmpd}/ai-sdk" checkout -q "${AISDK_COMMIT}" || die "could not check out pinned commit"
-[[ -e "${tmpd}/ai-sdk/${AISDK_LIB}/libVIPhal.so" ]] || die "expected libs missing at ${AISDK_LIB}"
-
-# --- Install runtime libs + headers --------------------------------------------
-log "Installing VIPLite libs to ${NPU_LIBDIR}"
-install -d "${NPU_LIBDIR}"
-install -m 0644 "${tmpd}/ai-sdk/${AISDK_LIB}"/*.so "${NPU_LIBDIR}/"
-echo "${NPU_LIBDIR}" > /etc/ld.so.conf.d/npu.conf
+# --- 3. install the matched Unified userspace 6.4.15 ------------------------
+if [[ ! -d "ai-sdk/.git" ]]; then
+    rm -rf ai-sdk && git clone --filter=blob:none --sparse "$AISDK_REPO" ai-sdk
+fi
+git -C ai-sdk checkout -q "$AISDK_COMMIT"
+git -C ai-sdk sparse-checkout set "$INC" "$UNI"
+grep -q "$GCHAL_VER" "ai-sdk/${INC}/HAL/gc_hal_version.h" \
+    || echo "WARN: userspace gcHAL != ${GCHAL_VER} — version skew will break vxCreateContext"
+install -d "$LIBDIR" "$INCDIR"
+cp -a "ai-sdk/${UNI}/"*.so* "$LIBDIR/"          # *.so* keeps SONAME symlinks (libOpenVX.so.1)
+cp -r "ai-sdk/${INC}/." "$INCDIR/"
+echo "$LIBDIR" > /etc/ld.so.conf.d/npu-unified.conf
 ldconfig
-install -d "${NPU_INCDIR}"
-cp -a "${tmpd}/ai-sdk/${AISDK_LIB}/inc/." "${NPU_INCDIR}/"
 
-# --- Build + install vpm_run (generic NBG runner) + a self-test model -----------
-log "Building vpm_run"
-make -C "${tmpd}/ai-sdk/examples/vpm_run" AI_SDK_PLATFORM=a733 > /dev/null || die "vpm_run build failed"
-install -m 0755 "${tmpd}/ai-sdk/examples/vpm_run/vpm_run" /usr/local/bin/
-install -d "${NPU_SHARE}"
-install -m 0644 "${tmpd}/ai-sdk/examples/vpm_run/operator/v3/network_binary.nb" "${NPU_SHARE}/"
-install -m 0644 "${tmpd}/ai-sdk/examples/vpm_run/operator/input_0.dat" "${NPU_SHARE}/"
+# --- 4. activate now (running == next boot) ---------------------------------
+lsmod | awk '{print $1}' | grep -qx vipcore && { rmmod vipcore || true; }
+modprobe -r galcore 2>/dev/null || true
+modprobe galcore || insmod "/lib/modules/${KREL}/updates/galcore.ko"
+[[ -e /dev/galcore ]] || { echo "FATAL: /dev/galcore did not appear (check dmesg)"; exit 1; }
+udevadm trigger --name-match=galcore 2>/dev/null || true
 
-# --- Device node ---------------------------------------------------------------
-# The driver already creates /dev/vipcore 0666; add an explicit rule for safety.
-echo 'KERNEL=="vipcore", MODE="0666"' > /etc/udev/rules.d/99-vipcore.rules
-
-# --- Activate now so running == next boot --------------------------------------
-log "Loading the NPU module"
-modprobe vipcore || die "modprobe vipcore failed; check dmesg"
-
-# --- Self-test: run a v3 NBG and confirm the kernel<->userspace handshake -------
-log "Self-testing the NPU (vpm_run on a v3 NBG)"
-printf '[network]\n%s/network_binary.nb\n[input]\n%s/input_0.dat\n' "${NPU_SHARE}" "${NPU_SHARE}" > "${tmpd}/selftest.txt"
-out="$(vpm_run -s "${tmpd}/selftest.txt" -l 1 2>&1)" || true
-if grep -q "vip lite init OK" <<< "${out}" \
-	&& grep -q "cid=0x1000003b" <<< "${out}" \
-	&& grep -q "vpm run ret=0" <<< "${out}"; then
-	log "NPU self-test PASSED — $(grep -oE 'VIPLite driver software version [0-9.]+-AW-[0-9-]+' <<< "${out}" | head -1)"
+# --- 5. self-test: version-matched OpenVX handshake -------------------------
+cat > "${WORK}/vx_probe.c" <<'PROBE'
+#include <stdio.h>
+#include <VX/vx.h>
+int main(void){
+    vx_context c = vxCreateContext();
+    if (vxGetStatus((vx_reference)c) != VX_SUCCESS){ printf("FAIL: vxCreateContext\n"); return 1; }
+    char impl[VX_MAX_IMPLEMENTATION_NAME] = {0};
+    vxQueryContext(c, VX_CONTEXT_IMPLEMENTATION, impl, sizeof(impl));
+    printf("OpenVX context OK (implementation=%s)\n", impl);
+    vxReleaseContext(&c);
+    return 0;
+}
+PROBE
+if gcc "${WORK}/vx_probe.c" -I"$INCDIR" -L"$LIBDIR" -Wl,-rpath-link,"$LIBDIR" -lOpenVX -o "${WORK}/vx_probe" 2>/dev/null; then
+    if VIVANTE_SDK_DIR="$INCDIR/.." LD_LIBRARY_PATH="$LIBDIR" "${WORK}/vx_probe"; then
+        echo "NPU self-test PASSED — galcore ${GCHAL_VER} <-> Unified/OpenVX userspace OK"
+    else
+        echo "NPU self-test FAILED — check version match and dmesg"; exit 1
+    fi
 else
-	die "NPU self-test failed; vpm_run output:\n${out}"
+    echo "WARN: self-test probe didn't compile (libs installed; check headers)"
 fi
 
-log "Done. NPU active now and on boot; vpm_run + a sample NBG installed."
-log "Convert your own ONNX→NBG (ACUITY or TIM-VX) and run: vpm_run -s <sample.txt> --show_top5 1"
+cat <<EOF
+
+Done. Unified/OpenVX path is live:
+  driver : galcore ${GCHAL_VER}  (/dev/galcore; vipcore blacklisted)
+  libs   : ${LIBDIR}   headers: ${INCDIR}
+To run real models build TIM-VX against the SDK (EXTERNAL_VIV_SDK), then ONNX-RT/TFLite.
+Revert to the VIPLite path: rm /etc/modprobe.d/npu-galcore-blacklist.conf \\
+  /etc/modules-load.d/npu-galcore.conf /lib/modules/${KREL}/updates/galcore.ko; depmod ${KREL};
+  rmmod galcore; enable-npu-vipcore   # or: modprobe vipcore
+EOF
