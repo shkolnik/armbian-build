@@ -17,6 +17,12 @@
 # (OPi bug #302). So we DO NOT enable CONFIG_AW_NNA_GALCORE; we DKMS-build the 6.4.15
 # driver from MaverickLong's package (6.4.15 source + a 6.6 kernel-API-drift patch).
 #
+# WHY a vipcore "kickstart" at boot: galcore 6.4.15 does NOT cold-init the NPU clocks/
+# regulator (logs `AXI/AHB CLK NULL`, `VOL FAIL`) — it only attaches to an already-powered
+# NPU. The in-tree vipcore driver does the full bring-up. So a oneshot loads vipcore (inits
+# the silicon) -> unloads it -> loads galcore, every boot. Without it galcore goes dark on
+# EVERY reboot (chipModel=0x0, probe -22). Root-cause + reproduction: notes/21 §7.
+#
 # NOTE (board DT): galcore is OPP-exact — it reads `npu-vf` and demands that exact OPP.
 # The OPi 4 Pro DT cap must set `npu-vf = <0x354>` (852MHz) for galcore to clock
 # correctly (see the board patch). Without it the NPU falls back to an unmanaged clock.
@@ -100,10 +106,27 @@ dkms status -m galcore -v "$GCHAL_VER" 2>/dev/null | grep -q . \
 dkms add     -m galcore -v "$GCHAL_VER"
 dkms build   -m galcore -v "$GCHAL_VER"
 dkms install -m galcore -v "$GCHAL_VER" --force          # installs to updates/dkms/, runs depmod
-echo "blacklist vipcore" > /etc/modprobe.d/npu-galcore-blacklist.conf   # galcore replaces vipcore
-echo "galcore"           > /etc/modules-load.d/npu-galcore.conf
+echo "blacklist vipcore" > /etc/modprobe.d/npu-galcore-blacklist.conf   # keep vipcore off normal autoload
 printf 'KERNEL=="galcore", MODE="0666"\n' > /etc/udev/rules.d/99-npu-galcore.rules
-rm -f /etc/modules-load.d/npu.conf /etc/udev/rules.d/99-vipcore.rules   # drop the vipcore path's drop-ins (mutually exclusive)
+# Drop the vipcore path's drop-ins AND galcore's old direct-autoload (the kickstart loads galcore now).
+rm -f /etc/modules-load.d/npu.conf /etc/modules-load.d/npu-galcore.conf /etc/udev/rules.d/99-vipcore.rules
+
+# galcore can't cold-init the NPU; kickstart it via in-tree vipcore each boot (see header WHY).
+cat > /etc/systemd/system/npu-galcore-kickstart.service <<'KICK'
+[Unit]
+Description=Kickstart NPU via in-tree vipcore so OOT galcore can cold-init (A733)
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'modprobe -r galcore 2>/dev/null || true; modprobe vipcore; sleep 1; modprobe -r vipcore; modprobe galcore'
+[Install]
+WantedBy=sysinit.target
+KICK
+systemctl daemon-reload
+systemctl enable npu-galcore-kickstart.service >/dev/null 2>&1 || true
 
 # --- 3. install the matched Unified userspace 6.4.15 ------------------------
 if [[ ! -d "ai-sdk/.git" ]]; then
@@ -128,8 +151,9 @@ echo "$LIBDIR" > /etc/ld.so.conf.d/npu-unified.conf
 ldconfig
 
 # --- 4. activate now (running == next boot) ---------------------------------
-lsmod | awk '{print $1}' | grep -qx vipcore && { rmmod vipcore || true; }
+# Same kickstart sequence as the boot oneshot, so this works even from a cold/dark NPU.
 modprobe -r galcore 2>/dev/null || true
+modprobe vipcore; sleep 1; modprobe -r vipcore || true
 modprobe galcore
 [[ -e /dev/galcore ]] || { echo "FATAL: /dev/galcore did not appear (check dmesg)"; exit 1; }
 udevadm trigger --name-match=galcore 2>/dev/null || true
@@ -165,8 +189,8 @@ Done. Unified/OpenVX path is live:
   libs   : ${LIBDIR}   headers: ${INCDIR}
 To run real models build TIM-VX against the SDK (EXTERNAL_VIV_SDK), then ONNX-RT/TFLite.
 Revert to the VIPLite path:
+  systemctl disable --now npu-galcore-kickstart.service; rm -f /etc/systemd/system/npu-galcore-kickstart.service
   dkms remove -m galcore -v ${GCHAL_VER} --all
-  rm -f /etc/modprobe.d/npu-galcore-blacklist.conf /etc/modules-load.d/npu-galcore.conf \\
-        /etc/udev/rules.d/99-npu-galcore.rules
-  depmod ${KREL}; rmmod galcore; enable-npu-vipcore   # or: modprobe vipcore
+  rm -f /etc/modprobe.d/npu-galcore-blacklist.conf /etc/udev/rules.d/99-npu-galcore.rules
+  systemctl daemon-reload; depmod ${KREL}; rmmod galcore; enable-npu-vipcore   # or: modprobe vipcore
 EOF

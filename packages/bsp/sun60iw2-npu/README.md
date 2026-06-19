@@ -22,7 +22,9 @@ What it does, on the running kernel (`linux-headers` must be present; installs `
    `/usr/src/galcore-6.4.15.3.690884`, then `dkms add/build/install` (`CONFIG_AW_NNA_GALCORE=m`).
    `AUTOINSTALL=yes`, so the module **auto-rebuilds on kernel updates**.
 2. DKMS installs the module to `/lib/modules/$(uname -r)/updates/dkms/` (+ `depmod`); the script
-   then **blacklists vipcore**, autoloads galcore (`modules-load.d`), adds a `/dev/galcore` udev rule.
+   keeps vipcore off normal autoload, adds a `/dev/galcore` udev rule, and installs a **boot
+   kickstart oneshot** (`npu-galcore-kickstart.service`) that loads in-tree vipcore to bring the
+   NPU up → unloads it → loads galcore, every boot (galcore can't cold-init — see below).
 3. Installs the matched **Unified userspace 6.4.15** (ai-sdk `unified-tina`, pinned, sparse) to
    `/usr/local/lib/npu-unified` (+ `ldconfig`), headers to `/usr/local/include/npu-unified`. The
    OpenVX libs ship the `.so`/`.so.1`/`.so.1.3.0` triplet as identical real files; the script
@@ -38,8 +40,8 @@ userspace is **6.4.15** — a 6.4.18 driver fails `vxCreateContext` with `NO_RES
 (orangepi-build bug #302). So the enabler does **not** enable `CONFIG_AW_NNA_GALCORE`; it
 DKMS-builds the 6.4.15 driver to match the userspace. Validated on HW 2026-06-19: clean run
 as a shipped unit, handshake OK, and TIM-VX **LeNet ran on the NPU** (see notes/22 §"★ RESOLVED",
-notes/23). **Revert:** `dkms remove -m galcore -v 6.4.15.3.690884 --all`, remove the
-modprobe/modules-load/udev drop-ins, `depmod`, then `enable-npu-vipcore` (or `modprobe vipcore`).
+notes/23). **Revert:** disable+remove `npu-galcore-kickstart.service`, `dkms remove -m galcore -v
+6.4.15.3.690884 --all`, remove the modprobe/udev drop-ins, `depmod`, then `enable-npu-vipcore`.
 
 **Running your own model:** build **TIM-VX** against the userspace (`-DEXTERNAL_VIV_SDK`),
 then ONNX-Runtime (VSINPU EP) or TFLite (VX delegate). A standalone bring-up/validation
@@ -74,6 +76,25 @@ and causes **intermittent silent compute errors**. The board DT patch
 because galcore is OPP-exact). Board-specific; other A733 boards with a dedicated NPU rail may
 keep 1008 MHz. (vipcore validated 10000/10000 golden at 852; the combined patch warrants a
 quick re-validation of both drivers at clean-test.)
+
+## NPU reboot-robustness — galcore needs the vipcore kickstart (root cause, verified 2026-06-19)
+
+**The OOT galcore 6.4.15 cannot cold-init the NPU**, so on its own it goes dark on **every reboot**
+(`chipModel=0x0`, `probe of 3600000.npu failed with error -22`). Its boot log shows what it's
+missing: `NPU AXI CLK NULL`, `NPU AHB CLK NULL`, `Get NPU VOL FAIL!`, `Unable to find node` — it does
+not acquire the NPU's clocks/regulator, only attaches to an already-powered NPU. The in-tree
+**vipcore** driver does the full clock/reset/power bring-up, so the `enable-npu` **kickstart oneshot**
+(load vipcore → unload → load galcore) makes galcore reboot-robust. Verified: clean reboot →
+`/dev/galcore`, `model=9000`. **vipcore alone is reboot-robust without any kickstart.**
+
+This is the real explanation for the earlier "went dark" scare: galcore was active (vipcore
+blacklisted), a reboot darked it, and every recovery attempt was galcore-only so it stayed dark; a
+reflash "fixed" it only because a fresh image boots vipcore by default. (Earlier drafts wrongly blamed
+a hardware power-island latch, then a hand-edited DTB — both disproven; the reboot, not the DTB, was
+the trigger.) **Recovery if galcore is dark (no reflash):** `modprobe vipcore && modprobe -r vipcore
+&& modprobe galcore`, or just start `npu-galcore-kickstart.service`. The cleaner long-term fix is to
+port vipcore's clock/regulator setup into galcore so it self-inits. Full record + reproduction:
+`notes/21` §7.
 
 ## Licensing
 

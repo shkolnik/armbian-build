@@ -50,10 +50,12 @@ modinfo vipcore > /dev/null 2>&1 || die "vipcore.ko not found for ${KVER}; kerne
 echo "vipcore" > /etc/modules-load.d/npu.conf
 
 # The galcore/Unified path drives the same NPU regs/IRQ — tear it down (mutually exclusive).
-# galcore is not in-tree (it loads only via its modules-load drop-in), so removing galcore's
-# drop-ins + unloading it is enough; no need to blacklist it.
-rm -f /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
+# galcore loads via its boot kickstart oneshot, not modules-load; disable that + remove drop-ins.
+systemctl disable --now npu-galcore-kickstart.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/npu-galcore-kickstart.service \
+      /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
       /etc/udev/rules.d/99-npu-galcore.rules
+systemctl daemon-reload >/dev/null 2>&1 || true
 lsmod | awk '{print $1}' | grep -qx galcore && { rmmod galcore || true; }
 
 # --- Prerequisites + fetch userspace -------------------------------------------
