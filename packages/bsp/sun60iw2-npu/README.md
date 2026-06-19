@@ -16,24 +16,30 @@ runtimes ride on. Use `enable-npu-vipcore` only for the minimal precompiled-NBG 
 
 ## `enable-npu` — Unified / OpenVX (galcore) — DEFAULT
 
-What it does, on the running kernel (`linux-headers` + `bsp/include` must be present):
-1. **Builds galcore 6.4.15** from MaverickLong's package (pinned) — applies its 6.6
-   kernel-API-drift patch + the `$(srctree)/$(src)→$(M)` Kbuild fix, `make CONFIG_AW_NNA_GALCORE=m`.
-2. Installs the module to `/lib/modules/$(uname -r)/updates/`, `depmod`, **blacklists vipcore**
-   and autoloads galcore (`modules-load.d`), adds a `/dev/galcore` udev rule.
+What it does, on the running kernel (`linux-headers` must be present; installs `dkms` if absent):
+1. **Builds galcore 6.4.15 via DKMS** from MaverickLong's package (pinned) — stages the patched
+   source (6.6 kernel-API-drift patch + the `$(srctree)/$(src)→$(M)` Kbuild fix) to
+   `/usr/src/galcore-6.4.15.3.690884`, then `dkms add/build/install` (`CONFIG_AW_NNA_GALCORE=m`).
+   `AUTOINSTALL=yes`, so the module **auto-rebuilds on kernel updates**.
+2. DKMS installs the module to `/lib/modules/$(uname -r)/updates/dkms/` (+ `depmod`); the script
+   then **blacklists vipcore**, autoloads galcore (`modules-load.d`), adds a `/dev/galcore` udev rule.
 3. Installs the matched **Unified userspace 6.4.15** (ai-sdk `unified-tina`, pinned, sparse) to
-   `/usr/local/lib/npu-unified` (+ `ldconfig`), headers to `/usr/local/include/npu-unified`.
+   `/usr/local/lib/npu-unified` (+ `ldconfig`), headers to `/usr/local/include/npu-unified`. The
+   OpenVX libs ship the `.so`/`.so.1`/`.so.1.3.0` triplet as identical real files; the script
+   collapses the SONAME/dev aliases to symlinks so `ldconfig` stays quiet.
 4. Activates now (rmmod vipcore → modprobe galcore) and **self-tests** a `vxCreateContext`
    handshake against the userspace.
 
-Idempotent, re-execs under sudo, activates now so running == next boot.
+Idempotent (safe to re-run), re-execs under sudo, activates now so running == next boot.
 
 **Why galcore 6.4.15 and not the in-tree driver:** the gcHAL kernel↔userspace versions must
 match **exactly**. Our BSP's in-tree galcore is **6.4.18**, but the only public Unified
 userspace is **6.4.15** — a 6.4.18 driver fails `vxCreateContext` with `NO_RESOURCES`
 (orangepi-build bug #302). So the enabler does **not** enable `CONFIG_AW_NNA_GALCORE`; it
-builds the 6.4.15 driver to match the userspace. Validated on HW 2026-06-18: handshake OK,
-and TIM-VX **LeNet ran on the NPU** (see notes/22 §"★ RESOLVED", notes/23).
+DKMS-builds the 6.4.15 driver to match the userspace. Validated on HW 2026-06-19: clean run
+as a shipped unit, handshake OK, and TIM-VX **LeNet ran on the NPU** (see notes/22 §"★ RESOLVED",
+notes/23). **Revert:** `dkms remove -m galcore -v 6.4.15.3.690884 --all`, remove the
+modprobe/modules-load/udev drop-ins, `depmod`, then `enable-npu-vipcore` (or `modprobe vipcore`).
 
 **Running your own model:** build **TIM-VX** against the userspace (`-DEXTERNAL_VIV_SDK`),
 then ONNX-Runtime (VSINPU EP) or TFLite (VX delegate). A standalone bring-up/validation

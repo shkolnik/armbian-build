@@ -49,6 +49,13 @@ log "Checking the in-tree NPU kernel driver (vipcore)"
 modinfo vipcore > /dev/null 2>&1 || die "vipcore.ko not found for ${KVER}; kernel wasn't built with CONFIG_AW_NNA_VIP=m"
 echo "vipcore" > /etc/modules-load.d/npu.conf
 
+# The galcore/Unified path drives the same NPU regs/IRQ — tear it down (mutually exclusive).
+# galcore is not in-tree (it loads only via its modules-load drop-in), so removing galcore's
+# drop-ins + unloading it is enough; no need to blacklist it.
+rm -f /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
+      /etc/udev/rules.d/99-npu-galcore.rules
+lsmod | awk '{print $1}' | grep -qx galcore && { rmmod galcore || true; }
+
 # --- Prerequisites + fetch userspace -------------------------------------------
 log "Installing prerequisites (git, build tools)"
 apt-get update
