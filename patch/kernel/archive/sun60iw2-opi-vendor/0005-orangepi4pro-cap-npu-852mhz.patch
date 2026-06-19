@@ -1,0 +1,28 @@
+Subject: [PATCH] orangepi4pro: cap NPU at 852MHz (shared 0.8V DCDC2 rail)
+
+On the OPi 4 Pro, VDD-NPU sits on the AXP8191 DCDC2 rail, shared with HDMI/DRAM/
+UFS/both combo-PHYs and pinned at 0.8V. The NPU 1008/1120MHz OPPs need 0.96V+,
+unreachable on this board, so the driver runs 1008MHz undervolted and produces
+intermittent silent compute errors (seen via vpm_run golden-compare). Delete those
+two OPPs in the board dts (not the shared SoC cpu-vf dtsi, so Radxa/other A733
+boards are unaffected) — the NPU then tops out at 852MHz/0.8V. Validated on HW:
+10000/10000 NPU golden compares pass at 852MHz.
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-orangepi-4-pro.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-orangepi-4-pro.dts
+index 4468cc2e6..4fe43aefa 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-orangepi-4-pro.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-orangepi-4-pro.dts
+@@ -2665,6 +2665,13 @@ &npu {
+ 	status = "okay";
+ };
+ 
++/* VDD-NPU shares the 0.8V DCDC2 rail (HDMI/DRAM/UFS/combo-PHYs), so it can't reach the
++ * 0.96V the 1008MHz OPP needs; cap at 852MHz (top 0.8V OPP) to avoid undervolt errors. */
++&npu_opp_table {
++	/delete-node/ opp-1008;
++	/delete-node/ opp-1120;
++};
++
+ &addr_mgt {
+ 	compatible     = "allwinner,sunxi-addr_mgt";
+ 	type_addr_wifi = <0x0>;
