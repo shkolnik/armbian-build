@@ -50,12 +50,14 @@ modinfo vipcore > /dev/null 2>&1 || die "vipcore.ko not found for ${KVER}; kerne
 echo "vipcore" > /etc/modules-load.d/npu.conf
 
 # The galcore/Unified path drives the same NPU regs/IRQ — tear it down (mutually exclusive).
-# galcore loads via its boot kickstart oneshot, not modules-load; disable that + remove drop-ins.
-systemctl disable --now npu-galcore-kickstart.service >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/npu-galcore-kickstart.service \
-      /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
+# galcore self-inits + autoloads via modules-load; remove its drop-ins (+ any legacy kickstart).
+rm -f /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
       /etc/udev/rules.d/99-npu-galcore.rules
-systemctl daemon-reload >/dev/null 2>&1 || true
+if [[ -e /etc/systemd/system/npu-galcore-kickstart.service ]]; then
+	systemctl disable --now npu-galcore-kickstart.service >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/npu-galcore-kickstart.service
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
 lsmod | awk '{print $1}' | grep -qx galcore && { rmmod galcore || true; }
 
 # --- Prerequisites + fetch userspace -------------------------------------------

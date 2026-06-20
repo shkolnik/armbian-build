@@ -17,15 +17,18 @@
 # (OPi bug #302). So we DO NOT enable CONFIG_AW_NNA_GALCORE; we DKMS-build the 6.4.15
 # driver from MaverickLong's package (6.4.15 source + a 6.6 kernel-API-drift patch).
 #
-# WHY a vipcore "kickstart" at boot: galcore 6.4.15 does NOT cold-init the NPU clocks/
-# regulator (logs `AXI/AHB CLK NULL`, `VOL FAIL`) — it only attaches to an already-powered
-# NPU. The in-tree vipcore driver does the full bring-up. So a oneshot loads vipcore (inits
-# the silicon) -> unloads it -> loads galcore, every boot. Without it galcore goes dark on
-# EVERY reboot (chipModel=0x0, probe -22). Root-cause + reproduction: notes/21 §7.
+# WHY the self-init patch: galcore's stock Allwinner glue is VIP1-era — it requests legacy
+# `npu-aclk`/`npu-hclk` (absent on A733) and never the A733 gate clocks (clk_bus/clk_mbus_gate/
+# clk_ahb_gate), so it couldn't cold-init the NPU (logs `AXI/AHB CLK NULL`, reads chipModel=0x0,
+# probe -22) and used to need a vipcore "kickstart" each boot. The embedded
+# galcore-a733-selfinit.patch (applied below) adds those three gate clocks to _AdjustParam,
+# mirroring vipcore's VIP2 bring-up, so galcore powers the NPU itself and survives reboots with
+# NO kickstart. Validated on HW 2026-06-19 (cold-init + 2 reboots). Root cause: notes/21 §7.
 #
-# NOTE (board DT): galcore is OPP-exact — it reads `npu-vf` and demands that exact OPP.
-# The OPi 4 Pro DT cap must set `npu-vf = <0x354>` (852MHz) for galcore to clock
-# correctly (see the board patch). Without it the NPU falls back to an unmanaged clock.
+# NOTE (clock rate): galcore's OPP/voltage parse still fails (`VOL FAIL`, rate:0), so it runs
+# the NPU at the PLL default (~840MHz) rather than reading `npu-vf`. That's SAFE on the OPi
+# 4 Pro: 840 < the 852 cap on the shared 0.8V DCDC2 rail, so no undervolt. The `npu-vf=852`
+# DT cap still governs the vipcore path. (Porting galcore's OPP rate-set is a future polish.)
 set -euo pipefail
 
 # --- pinned sources ---------------------------------------------------------
@@ -65,6 +68,111 @@ if [[ ! -d galcore-pkg/.git ]]; then
     rm -rf galcore-pkg && git clone "$GALCORE_REPO" galcore-pkg
 fi
 git -C galcore-pkg fetch -q origin "$GALCORE_COMMIT" && git -C galcore-pkg checkout -q "$GALCORE_COMMIT"
+
+# A733 self-init patch (our addition): add the gate clocks galcore needs to cold-init the
+# NPU, so no vipcore kickstart is required. Applied with patch -p1 at the package root.
+cat > "${WORK}/galcore-a733-selfinit.patch" <<'SELFINIT'
+--- a/aw_nna_galcore/os/platform/allwinner/gc_hal_kernel_platform_allwinner.c
++++ b/aw_nna_galcore/os/platform/allwinner/gc_hal_kernel_platform_allwinner.c
+@@ -282,9 +282,21 @@ gceSTATUS _AdjustParam(IN gcsPLATFORM *Platform, OUT gcsMODULE_PARAMETERS *Args)
+ 	if (IS_ERR_OR_NULL(aw_driver.aclk))
+ 		pr_notice("NPU AXI CLK NULL\n");
+ 	aw_driver.hclk = of_clk_get_by_name(pdev->dev.of_node, "npu-hclk");
+-	if (IS_ERR_OR_NULL(aw_driver.aclk))
++	if (IS_ERR_OR_NULL(aw_driver.hclk))
+ 		pr_notice("NPU AHB CLK NULL\n");
+
++	/* A733 (sun60iw2) bus + gate clocks — without these the NPU bus is unclocked
++	 * and registers read 0x0. vipcore enables them; galcore's VIP1-era glue didn't. */
++	aw_driver.bus = of_clk_get_by_name(pdev->dev.of_node, "clk_bus");
++	if (IS_ERR_OR_NULL(aw_driver.bus))
++		pr_notice("NPU BUS CLK NULL\n");
++	aw_driver.mbus_gate = of_clk_get_by_name(pdev->dev.of_node, "clk_mbus_gate");
++	if (IS_ERR_OR_NULL(aw_driver.mbus_gate))
++		pr_notice("NPU MBUS GATE NULL\n");
++	aw_driver.ahb_gate = of_clk_get_by_name(pdev->dev.of_node, "clk_ahb_gate");
++	if (IS_ERR_OR_NULL(aw_driver.ahb_gate))
++		pr_notice("NPU AHB GATE NULL\n");
++
+ 	aw_driver.arst = devm_reset_control_get(&pdev->dev, "npu_axi_rst");
+ 	if (IS_ERR_OR_NULL(aw_driver.arst))
+ 		pr_notice("NPU AXI RST NULL\n");
+@@ -339,28 +351,49 @@ gceSTATUS _AdjustParam(IN gcsPLATFORM *Platform, OUT gcsMODULE_PARAMETERS *Args)
+ #if IS_ENABLED(CONFIG_AW_PM_DOMAINS)
+ 		pm_runtime_enable(dev);
+ #else
+-		if (!IS_ERR_OR_NULL(aw_driver.hclk)) {
+-			if (clk_prepare_enable(aw_driver.hclk)) {
+-				pr_err("galcore: Couldn't enable AHB clock\n");
++		/* Order mirrors vipcore's VIP2 npu_clk_init: deassert resets, then
++		 * gate clocks (ahb_gate, mbus_gate, bus), then bus/module clocks. */
++		if (!IS_ERR_OR_NULL(aw_driver.hrst)) {
++			if (reset_control_deassert(aw_driver.hrst)) {
++				pr_err("galcore: Couldn't deassert AHB RST\n");
+ 				return -EBUSY;
+ 			}
+ 		}
+-		if (!IS_ERR_OR_NULL(aw_driver.aclk)) {
+-			if (clk_prepare_enable(aw_driver.aclk)) {
+-				pr_err("galcore: Couldn't enable AXI clock\n");
++		if (!IS_ERR_OR_NULL(aw_driver.arst)) {
++			if (reset_control_deassert(aw_driver.arst)) {
++				pr_err("galcore: Couldn't deassert AXI RST\n");
+ 				return -EBUSY;
+ 			}
+ 		}
+
+-		if (!IS_ERR_OR_NULL(aw_driver.hrst)) {
+-			if (reset_control_deassert(aw_driver.hrst)) {
+-				pr_err("galcore: Couldn't deassert AHB RST\n");
++		if (!IS_ERR_OR_NULL(aw_driver.ahb_gate)) {
++			if (clk_prepare_enable(aw_driver.ahb_gate)) {
++				pr_err("galcore: Couldn't enable AHB GATE clock\n");
+ 				return -EBUSY;
+ 			}
+ 		}
+-		if (!IS_ERR_OR_NULL(aw_driver.arst)) {
+-			if (reset_control_deassert(aw_driver.arst)) {
+-				pr_err("galcore: Couldn't deassert AXI RST\n");
++		if (!IS_ERR_OR_NULL(aw_driver.mbus_gate)) {
++			if (clk_prepare_enable(aw_driver.mbus_gate)) {
++				pr_err("galcore: Couldn't enable MBUS GATE clock\n");
++				return -EBUSY;
++			}
++		}
++		if (!IS_ERR_OR_NULL(aw_driver.bus)) {
++			if (clk_prepare_enable(aw_driver.bus)) {
++				pr_err("galcore: Couldn't enable BUS clock\n");
++				return -EBUSY;
++			}
++		}
++
++		if (!IS_ERR_OR_NULL(aw_driver.hclk)) {
++			if (clk_prepare_enable(aw_driver.hclk)) {
++				pr_err("galcore: Couldn't enable AHB clock\n");
++				return -EBUSY;
++			}
++		}
++		if (!IS_ERR_OR_NULL(aw_driver.aclk)) {
++			if (clk_prepare_enable(aw_driver.aclk)) {
++				pr_err("galcore: Couldn't enable AXI clock\n");
+ 				return -EBUSY;
+ 			}
+ 		}
+--- a/aw_nna_galcore/os/platform/allwinner/gc_hal_kernel_platform_allwinner.h
++++ b/aw_nna_galcore/os/platform/allwinner/gc_hal_kernel_platform_allwinner.h
+@@ -22,6 +22,9 @@ typedef struct _aw_driver_t {
+ 	struct clk *pclk;
+ 	struct clk *aclk;
+ 	struct clk *hclk;
++	struct clk *bus;
++	struct clk *mbus_gate;
++	struct clk *ahb_gate;
+ 	struct reset_control *arst;
+ 	struct reset_control *hrst;
+ 	struct regulator *regulator;
+SELFINIT
+
 (
     cd galcore-pkg
     grep -q "$GCHAL_VER" aw_nna_galcore/hal/inc/gc_hal_version.h \
@@ -73,6 +181,10 @@ git -C galcore-pkg fetch -q origin "$GALCORE_COMMIT" && git -C galcore-pkg check
     # apply_*.bash uses git-apply which needs a git toplevel a fresh checkout lacks).
     if ! patch -p1 --reverse --dry-run <galcore_6.6_kernel_api_drift.patch >/dev/null 2>&1; then
         patch -p1 <galcore_6.6_kernel_api_drift.patch
+    fi
+    # Apply our A733 self-init patch (gate clocks) — idempotent (skip if already applied).
+    if ! patch -p1 --reverse --dry-run <"${WORK}/galcore-a733-selfinit.patch" >/dev/null 2>&1; then
+        patch -p1 <"${WORK}/galcore-a733-selfinit.patch"
     fi
     # Vendor build glue uses $(srctree)/$(src), which only resolves for in-tree builds;
     # rewrite to $(M) for the OOT/DKMS (M=) build. Idempotent (no-op once rewritten).
@@ -108,25 +220,16 @@ dkms build   -m galcore -v "$GCHAL_VER"
 dkms install -m galcore -v "$GCHAL_VER" --force          # installs to updates/dkms/, runs depmod
 echo "blacklist vipcore" > /etc/modprobe.d/npu-galcore-blacklist.conf   # keep vipcore off normal autoload
 printf 'KERNEL=="galcore", MODE="0666"\n' > /etc/udev/rules.d/99-npu-galcore.rules
-# Drop the vipcore path's drop-ins AND galcore's old direct-autoload (the kickstart loads galcore now).
-rm -f /etc/modules-load.d/npu.conf /etc/modules-load.d/npu-galcore.conf /etc/udev/rules.d/99-vipcore.rules
-
-# galcore can't cold-init the NPU; kickstart it via in-tree vipcore each boot (see header WHY).
-cat > /etc/systemd/system/npu-galcore-kickstart.service <<'KICK'
-[Unit]
-Description=Kickstart NPU via in-tree vipcore so OOT galcore can cold-init (A733)
-DefaultDependencies=no
-After=systemd-modules-load.service
-Before=sysinit.target
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'modprobe -r galcore 2>/dev/null || true; modprobe vipcore; sleep 1; modprobe -r vipcore; modprobe galcore'
-[Install]
-WantedBy=sysinit.target
-KICK
-systemctl daemon-reload
-systemctl enable npu-galcore-kickstart.service >/dev/null 2>&1 || true
+# galcore self-inits the NPU now (gate-clock patch), so just load it directly at boot.
+echo galcore > /etc/modules-load.d/npu-galcore.conf
+# Drop the vipcore path's drop-ins.
+rm -f /etc/modules-load.d/npu.conf /etc/udev/rules.d/99-vipcore.rules
+# Remove any prior vipcore "kickstart" (older enabler versions) — no longer needed.
+if [[ -e /etc/systemd/system/npu-galcore-kickstart.service ]]; then
+    systemctl disable --now npu-galcore-kickstart.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/npu-galcore-kickstart.service
+    systemctl daemon-reload
+fi
 
 # --- 3. install the matched Unified userspace 6.4.15 ------------------------
 if [[ ! -d "ai-sdk/.git" ]]; then
@@ -151,9 +254,9 @@ echo "$LIBDIR" > /etc/ld.so.conf.d/npu-unified.conf
 ldconfig
 
 # --- 4. activate now (running == next boot) ---------------------------------
-# Same kickstart sequence as the boot oneshot, so this works even from a cold/dark NPU.
+# galcore self-inits the NPU (gate-clock patch), so no vipcore needed — just (re)load it.
 modprobe -r galcore 2>/dev/null || true
-modprobe vipcore; sleep 1; modprobe -r vipcore || true
+modprobe -r vipcore 2>/dev/null || true
 modprobe galcore
 [[ -e /dev/galcore ]] || { echo "FATAL: /dev/galcore did not appear (check dmesg)"; exit 1; }
 udevadm trigger --name-match=galcore 2>/dev/null || true
@@ -189,8 +292,7 @@ Done. Unified/OpenVX path is live:
   libs   : ${LIBDIR}   headers: ${INCDIR}
 To run real models build TIM-VX against the SDK (EXTERNAL_VIV_SDK), then ONNX-RT/TFLite.
 Revert to the VIPLite path:
-  systemctl disable --now npu-galcore-kickstart.service; rm -f /etc/systemd/system/npu-galcore-kickstart.service
   dkms remove -m galcore -v ${GCHAL_VER} --all
-  rm -f /etc/modprobe.d/npu-galcore-blacklist.conf /etc/udev/rules.d/99-npu-galcore.rules
-  systemctl daemon-reload; depmod ${KREL}; rmmod galcore; enable-npu-vipcore   # or: modprobe vipcore
+  rm -f /etc/modprobe.d/npu-galcore-blacklist.conf /etc/udev/rules.d/99-npu-galcore.rules /etc/modules-load.d/npu-galcore.conf
+  depmod ${KREL}; rmmod galcore; enable-npu-vipcore   # or: modprobe vipcore
 EOF
