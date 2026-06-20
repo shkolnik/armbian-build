@@ -72,11 +72,11 @@ If you bump either side of either path, re-check the handshake.
 On the **Orange Pi 4 Pro** `VDD-NPU` shares the 0.8 V `DCDC2` rail (HDMI/DRAM/UFS/combo-PHYs),
 so the NPU cannot reach the 0.96 V its 1008 MHz OPP needs — running 1008 MHz undervolts the NPU
 and causes **intermittent silent compute errors**. The board DT patch
-`0005-orangepi4pro-cap-npu-852mhz.patch` caps at 852 MHz: it deletes the 1008/1120 MHz OPPs
-(caps vipcore, which selects the top OPP) **and** retargets `npu-vf` to `0x354` (852 — required
-because galcore is OPP-exact). Board-specific; other A733 boards with a dedicated NPU rail may
-keep 1008 MHz. (vipcore validated 10000/10000 golden at 852; the combined patch warrants a
-quick re-validation of both drivers at clean-test.)
+`0005-orangepi4pro-cap-npu-852mhz.patch` caps at 852 MHz by **deleting the 1008/1120 MHz OPPs**
+— this is what caps **vipcore** (which selects the top OPP). It also retargets `npu-vf` to `0x354`
+(852) as **galcore**'s intended OPP, though galcore today runs the PLL default (~840 MHz — safe,
+below the cap) because its OPP rate-set is incomplete. Board-specific; other A733 boards with a
+dedicated NPU rail may keep 1008 MHz. (vipcore validated 10000/10000 golden at 852.)
 
 ## NPU reboot-robustness — galcore self-inits via the gate-clock patch (verified 2026-06-19)
 

@@ -27,8 +27,8 @@
 #
 # NOTE (clock rate): galcore's OPP/voltage parse still fails (`VOL FAIL`, rate:0), so it runs
 # the NPU at the PLL default (~840MHz) rather than reading `npu-vf`. That's SAFE on the OPi
-# 4 Pro: 840 < the 852 cap on the shared 0.8V DCDC2 rail, so no undervolt. The `npu-vf=852`
-# DT cap still governs the vipcore path. (Porting galcore's OPP rate-set is a future polish.)
+# 4 Pro: 840 < the 852 cap on the shared 0.8V DCDC2 rail, so no undervolt. The board DT cap
+# (deleted 1008/1120 OPPs) governs the vipcore path. (galcore's OPP rate-set is a future polish.)
 set -euo pipefail
 
 # --- pinned sources ---------------------------------------------------------
