@@ -7,6 +7,7 @@ INTRODUCED="2025"
 KERNEL_TARGET="vendor"
 KERNEL_TEST_TARGET="vendor"
 IMAGE_PARTITION_TABLE="msdos"
+HAS_VIDEO_OUTPUT="yes"
 
 # --- Board-specific build configuration ---
 BOOT_FDT_FILE="allwinner/sun60i-a733-orangepi-4-pro.dtb"
