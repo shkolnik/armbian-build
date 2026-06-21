@@ -51,8 +51,11 @@ echo "vipcore" > /etc/modules-load.d/npu.conf
 
 # The galcore/Unified path drives the same NPU regs/IRQ — tear it down (mutually exclusive).
 # galcore self-inits + autoloads via modules-load; remove its drop-ins (+ any legacy kickstart).
+# Also drop the Unified SDK root + VIVANTE_SDK_DIR export so a VIPLite runtime isn't pointed at
+# the Unified SDK (the npu-unified libs/headers stay installed — re-enable is then fast).
 rm -f /etc/modules-load.d/npu-galcore.conf /etc/modprobe.d/npu-galcore-blacklist.conf \
-      /etc/udev/rules.d/99-npu-galcore.rules
+      /etc/udev/rules.d/99-npu-galcore.rules /etc/profile.d/npu-vivante-sdk.sh
+rm -rf /usr/local/vivante-sdk
 if [[ -e /etc/systemd/system/npu-galcore-kickstart.service ]]; then
 	systemctl disable --now npu-galcore-kickstart.service >/dev/null 2>&1 || true
 	rm -f /etc/systemd/system/npu-galcore-kickstart.service

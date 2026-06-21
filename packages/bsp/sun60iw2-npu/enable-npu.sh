@@ -29,6 +29,15 @@
 # the NPU at the PLL default (~840MHz) rather than reading `npu-vf`. That's SAFE on the OPi
 # 4 Pro: 840 < the 852 cap on the shared 0.8V DCDC2 rail, so no undervolt. The board DT cap
 # (deleted 1008/1120 OPPs) governs the vipcore path. (galcore's OPP rate-set is a future polish.)
+#
+# WHY the cl_viv_vx_ext.h header (added 2026-06-21): the Radxa unified-tina SDK ships inc/{VX,HAL}
+# but DROPPED inc/CL, so the online EVIS GPGPU shader compiler can't find cl_viv_vx_ext.h and EVERY
+# online-compiled shader fails "Cannot find the header file" (FP16 elementwise Max, swish, tanh/gelu/
+# erf/..., and the off-the-shelf openWakeWord slice+Max rewrite). Precompiled vivante.nn.* conv/pool
+# kernels don't #include it, so they worked — masking the gap. We restore the version-matched 6.4.15
+# header (from VeriSilicon's TIM-VX prebuilt-sdk) into a canonical SDK root so the shader compiler
+# (which searches $VIVANTE_SDK_DIR/include/CL) finds it. Validated on HW 2026-06-21: maximum shader
+# compiles + bit-exact; oww runs on the NPU (cosine 0.9997). See notes/30, 31.
 set -euo pipefail
 
 # --- pinned sources ---------------------------------------------------------
@@ -36,12 +45,17 @@ GALCORE_REPO="https://github.com/MaverickLong/Radxa-A733-NPU-Unified-Driver-Supp
 GALCORE_COMMIT="69548908aeedfa349a63d6a268ae0c88e0d18ee3"   # galcore 6.4.15.3.690884 + 6.6 drift patch
 AISDK_REPO="https://github.com/ZIFENG278/ai-sdk.git"
 AISDK_COMMIT="fc90006d0f6569da2f6726c2d8395877686f5aca"     # Unified userspace 6.4.15.3.690884
+# cl_viv_vx_ext.h is NOT in the ai-sdk repo (the dropped-CL gap); fetch the version-matched copy
+# from VeriSilicon's TIM-VX prebuilt-sdk (VERSION 6.4.15_CL690884A — same 690884 build as our userspace).
+TIMVX_COMMIT="ed47c5c24c523a89f700646465bbcd70855581ff"
+CLHDR_URL="https://raw.githubusercontent.com/VeriSilicon/TIM-VX/${TIMVX_COMMIT}/prebuilt-sdk/x86_64_linux/include/CL/cl_viv_vx_ext.h"
 GCHAL_VER="6.4.15.3.690884"
 INC="unified-tina/inc"
 UNI="unified-tina/lib/aarch64-none-linux-gnu"
 
 LIBDIR="/usr/local/lib/npu-unified"
 INCDIR="/usr/local/include/npu-unified"
+SDKROOT="/usr/local/vivante-sdk"          # canonical SDK root: $SDKROOT/include/CL/cl_viv_vx_ext.h
 WORK="/var/cache/npu-galcore-build"
 SRCDIR="/usr/src/galcore-${GCHAL_VER}"   # DKMS source tree (must live under /usr/src)
 KREL="$(uname -r)"
@@ -242,6 +256,17 @@ grep -q "$GCHAL_VER" "ai-sdk/${INC}/HAL/gc_hal_version.h" \
 install -d "$LIBDIR" "$INCDIR"
 cp -a "ai-sdk/${UNI}/"*.so* "$LIBDIR/"
 cp -r "ai-sdk/${INC}/." "$INCDIR/"
+# Restore the CL EVIS shader header the Radxa SDK dropped (see top comment): fetch the
+# version-matched 6.4.15 cl_viv_vx_ext.h so online-compiled GPGPU shaders can #include it.
+# Opt-in fetch, like the rest of the userspace; idempotent (skip if already present + valid).
+install -d "$INCDIR/CL"
+if ! grep -q VXC_512Bits "$INCDIR/CL/cl_viv_vx_ext.h" 2>/dev/null; then
+    { command -v curl >/dev/null && curl -fsSL "$CLHDR_URL" -o "$INCDIR/CL/cl_viv_vx_ext.h"; } \
+        || wget -qO "$INCDIR/CL/cl_viv_vx_ext.h" "$CLHDR_URL" \
+        || { echo "FATAL: could not fetch cl_viv_vx_ext.h — EVIS shaders will fail"; exit 1; }
+    grep -q VXC_512Bits "$INCDIR/CL/cl_viv_vx_ext.h" \
+        || { echo "FATAL: fetched cl_viv_vx_ext.h looks wrong (no VXC_512Bits)"; exit 1; }
+fi
 # Some libs ship X.so / X.so.N / X.so.N.M.P as identical real files; collapse the
 # SONAME/dev aliases to symlinks so ldconfig doesn't warn (cosmetic).
 ( cd "$LIBDIR"
@@ -252,6 +277,12 @@ cp -r "ai-sdk/${INC}/." "$INCDIR/"
   done )
 echo "$LIBDIR" > /etc/ld.so.conf.d/npu-unified.conf
 ldconfig
+# Canonical SDK root so runtimes (TIM-VX / ONNX-RT) find headers+libs via the standard
+# $VIVANTE_SDK_DIR/{include,lib} layout — the EVIS shader compiler searches $VIVANTE_SDK_DIR/include/CL.
+install -d "$SDKROOT"
+ln -sfn "$INCDIR" "$SDKROOT/include"
+ln -sfn "$LIBDIR" "$SDKROOT/lib"
+printf 'export VIVANTE_SDK_DIR=%s\n' "$SDKROOT" > /etc/profile.d/npu-vivante-sdk.sh
 
 # --- 4. activate now (running == next boot) ---------------------------------
 # galcore self-inits the NPU (gate-clock patch), so no vipcore needed — just (re)load it.
@@ -275,9 +306,12 @@ int main(void){
     return 0;
 }
 PROBE
+# Assert the EVIS shader header resolves via the canonical SDK root (the dropped-CL fix).
+[[ -s "$SDKROOT/include/CL/cl_viv_vx_ext.h" ]] \
+    || { echo "FATAL: $SDKROOT/include/CL/cl_viv_vx_ext.h missing — EVIS GPGPU shaders will fail"; exit 1; }
 if gcc "${WORK}/vx_probe.c" -I"$INCDIR" -L"$LIBDIR" -Wl,-rpath-link,"$LIBDIR" -lOpenVX -o "${WORK}/vx_probe" 2>/dev/null; then
-    if VIVANTE_SDK_DIR="$INCDIR/.." LD_LIBRARY_PATH="$LIBDIR" "${WORK}/vx_probe"; then
-        echo "NPU self-test PASSED — galcore ${GCHAL_VER} <-> Unified/OpenVX userspace OK"
+    if VIVANTE_SDK_DIR="$SDKROOT" LD_LIBRARY_PATH="$LIBDIR" "${WORK}/vx_probe"; then
+        echo "NPU self-test PASSED — galcore ${GCHAL_VER} <-> Unified/OpenVX OK; EVIS shader header in place"
     else
         echo "NPU self-test FAILED — check version match and dmesg"; exit 1
     fi
@@ -289,8 +323,9 @@ cat <<EOF
 
 Done. Unified/OpenVX path is live:
   driver : galcore ${GCHAL_VER}  (DKMS; /dev/galcore; vipcore blacklisted)
-  libs   : ${LIBDIR}   headers: ${INCDIR}
-To run real models build TIM-VX against the SDK (EXTERNAL_VIV_SDK), then ONNX-RT/TFLite.
+  libs   : ${LIBDIR}   headers: ${INCDIR}  (incl. CL/cl_viv_vx_ext.h — EVIS shader fix)
+  SDK    : ${SDKROOT}  (set VIVANTE_SDK_DIR here; /etc/profile.d does this for login shells)
+To run real models build TIM-VX against the SDK (EXTERNAL_VIV_SDK=${SDKROOT}), then ONNX-RT/TFLite.
 Revert to the VIPLite path:
   dkms remove -m galcore -v ${GCHAL_VER} --all
   rm -f /etc/modprobe.d/npu-galcore-blacklist.conf /etc/udev/rules.d/99-npu-galcore.rules /etc/modules-load.d/npu-galcore.conf

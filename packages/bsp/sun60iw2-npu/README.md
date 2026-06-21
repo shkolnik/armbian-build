@@ -30,8 +30,15 @@ What it does, on the running kernel (`linux-headers` must be present; installs `
    `/usr/local/lib/npu-unified` (+ `ldconfig`), headers to `/usr/local/include/npu-unified`. The
    OpenVX libs ship the `.so`/`.so.1`/`.so.1.3.0` triplet as identical real files; the script
    collapses the SONAME/dev aliases to symlinks so `ldconfig` stays quiet.
-4. Activates now (rmmod vipcore → modprobe galcore) and **self-tests** a `vxCreateContext`
-   handshake against the userspace.
+4. Restores the **`cl_viv_vx_ext.h` EVIS shader header** the Radxa SDK dropped (it ships
+   `inc/{VX,HAL}` but no `inc/CL`), fetched version-matched from VeriSilicon's TIM-VX prebuilt-sdk,
+   and sets up a canonical SDK root at **`/usr/local/vivante-sdk`** (`include`/`lib` symlinks +
+   a `VIVANTE_SDK_DIR` export in `/etc/profile.d`). Without it, every **online-compiled EVIS GPGPU
+   shader** fails *"Cannot find the header file cl_viv_vx_ext.h"* (FP16 elementwise Max, swish,
+   tanh/gelu/erf/…, and the off-the-shelf openWakeWord slice+Max rewrite) — only the precompiled
+   `vivante.nn.*` conv/pool kernels worked, masking the gap. See notes/30, 31.
+5. Activates now (rmmod vipcore → modprobe galcore) and **self-tests** a `vxCreateContext`
+   handshake + asserts the EVIS shader header is in place.
 
 Idempotent (safe to re-run), re-execs under sudo, activates now so running == next boot.
 
@@ -44,8 +51,9 @@ as a shipped unit, handshake OK, and TIM-VX **LeNet ran on the NPU** (see notes/
 notes/23). **Revert:** `dkms remove -m galcore -v 6.4.15.3.690884 --all`, remove the
 modprobe/udev/modules-load drop-ins, `depmod`, then `enable-npu-vipcore`.
 
-**Running your own model:** build **TIM-VX** against the userspace (`-DEXTERNAL_VIV_SDK`),
-then ONNX-Runtime (VSINPU EP) or TFLite (VX delegate). A standalone bring-up/validation
+**Running your own model:** build **TIM-VX** against the SDK root
+(`-DEXTERNAL_VIV_SDK=/usr/local/vivante-sdk`; `VIVANTE_SDK_DIR` points there at runtime so the EVIS
+shader compiler finds `include/CL/cl_viv_vx_ext.h`), then ONNX-Runtime (VSINPU EP) or TFLite (VX delegate). A standalone bring-up/validation
 recipe lives at the project root: `npu-galcore-timvx-bringup.sh`. Known A733 caveats: cast
 conv/FC operands to UINT8; use FullyConnected instead of batched MatMul.
 
